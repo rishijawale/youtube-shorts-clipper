@@ -3,7 +3,7 @@
 YouTube Shorts Highlight Clipper
 Automatically detects viewer replay heatmap peaks or audio energy spikes,
 clips the highlight moment, formats into 9:16 vertical video (1080x1920),
-and burns in high-contrast Shorts-style subtitles.
+and burns in high-contrast Shorts-style subtitles (via YouTube VTT or local faster-whisper AI).
 """
 
 import os
@@ -68,7 +68,6 @@ def find_audio_spikes(url, total_duration, clip_duration=45.0, top_n=1, temp_dir
         except Exception:
             pass
 
-    # Quick download low-bitrate audio (takes ~3-5 seconds even for 30m+ video)
     dl_cmd = [
         "yt-dlp",
         "-f", "139/249/ba[abr<70]/ba",
@@ -78,19 +77,16 @@ def find_audio_spikes(url, total_duration, clip_duration=45.0, top_n=1, temp_dir
     ]
     run_cmd(dl_cmd)
 
-    # Find the actual audio file
     found_files = list(Path(temp_dir).glob("temp_probe_audio*"))
     if not found_files:
         raise FileNotFoundError("Audio probe file could not be downloaded")
     audio_file = str(found_files[0])
 
-    # Decode audio to mono 16kHz PCM
     sr = 16000
     ff_cmd = ["ffmpeg", "-v", "error", "-i", audio_file, "-f", "s16le", "-ac", "1", "-ar", str(sr), "-"]
     proc = subprocess.run(ff_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     raw = np.frombuffer(proc.stdout, dtype=np.int16)
 
-    # Clean up temp audio file
     try:
         os.remove(audio_file)
     except Exception:
@@ -99,18 +95,15 @@ def find_audio_spikes(url, total_duration, clip_duration=45.0, top_n=1, temp_dir
     if len(raw) == 0:
         return []
 
-    # Calculate RMS per 1-second window
     num_secs = len(raw) // sr
     rms = np.zeros(num_secs, dtype=np.float32)
     for i in range(num_secs):
         chunk = raw[i * sr : (i + 1) * sr].astype(np.float32)
         rms[i] = np.sqrt(np.mean(chunk**2))
 
-    # Ignore first 30 seconds or 5% of video
     intro_cutoff = min(30, int(total_duration * 0.05))
     rms[:intro_cutoff] = 0
 
-    # Sort peaks descending
     sorted_indices = np.argsort(rms)[::-1]
 
     spikes = []
@@ -118,7 +111,6 @@ def find_audio_spikes(url, total_duration, clip_duration=45.0, top_n=1, temp_dir
         peak_time = float(idx)
         peak_val = float(rms[idx])
 
-        # Avoid overlapping peaks
         if any(abs(peak_time - s["peak_time"]) < clip_duration * 0.8 for s in spikes):
             continue
 
@@ -155,13 +147,11 @@ def find_heatmap_spikes(heatmap, total_duration, clip_duration=45.0, top_n=1):
         mid = (st + et) / 2.0
         points.append((mid, val, st, et))
 
-    # Skip first 5% or 15s to ignore initial load spike
     cutoff_time = min(15.0, total_duration * 0.05) if total_duration > 60 else 0
     valid_points = [p for p in points if p[0] >= cutoff_time]
     if not valid_points:
         valid_points = points
 
-    # Find local peaks
     peaks = []
     n = len(valid_points)
     for i in range(1, n - 1):
@@ -172,13 +162,10 @@ def find_heatmap_spikes(heatmap, total_duration, clip_duration=45.0, top_n=1):
             peaks.append(valid_points[i])
 
     if not peaks:
-        # Fallback to absolute maximums
         peaks = sorted(valid_points, key=lambda x: x[1], reverse=True)[:5]
 
-    # Sort peaks by intensity descending
     peaks = sorted(peaks, key=lambda x: x[1], reverse=True)
 
-    # Filter out peaks that are too close to each other (< clip_duration apart)
     selected_spikes = []
     for p in peaks:
         peak_time = p[0]
@@ -186,7 +173,6 @@ def find_heatmap_spikes(heatmap, total_duration, clip_duration=45.0, top_n=1):
         if any(abs(peak_time - s["peak_time"]) < clip_duration * 0.8 for s in selected_spikes):
             continue
 
-        # Position the peak around 50-60% into the clip for natural build-up & reaction
         start_t = max(0.0, peak_time - (clip_duration * 0.55))
         end_t = min(total_duration, start_t + clip_duration)
         if (end_t - start_t) < clip_duration and start_t > 0:
@@ -257,7 +243,6 @@ def convert_vtt_to_shorts_ass(vtt_path, ass_path, clip_start, clip_end):
         lines = [l.strip() for l in raw_text.splitlines() if l.strip()]
         text = " ".join(lines)
 
-        # Ignore repeated consecutive auto-sub lines
         if not text or text == last_text:
             continue
         last_text = text
@@ -271,7 +256,6 @@ def convert_vtt_to_shorts_ass(vtt_path, ass_path, clip_start, clip_end):
     if not cues:
         return False
 
-    # Break longer cues into short 2-4 word punchy phrases for TikTok/Shorts
     chunked_cues = []
     for st, et, text in cues:
         words = text.split()
@@ -287,9 +271,6 @@ def convert_vtt_to_shorts_ass(vtt_path, ass_path, clip_start, clip_end):
                 chunk_et = min(et, chunk_st + chunk_dur)
                 chunked_cues.append((chunk_st, chunk_et, " ".join(sub_words).upper()))
 
-    # ASS Header with high-impact Shorts font styling
-    # Font: Arial Black / Impact, Bold, Bright Yellow text (&H0000FFFF), Deep Black outline (&H00000000)
-    # Alignment: 2 (Bottom Center), MarginV: 340 (comfortably above Shorts UI elements)
     ass_header = """[Script Info]
 ScriptType: v4.00+
 PlayResX: 1080
@@ -313,6 +294,64 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         f.write(ass_header + "\n".join(events) + "\n")
 
     return True
+
+def transcribe_with_whisper(media_path, ass_path):
+    """
+    AI Speech-to-Text Fallback using faster-whisper.
+    Used when YouTube has no uploaded subtitles.
+    """
+    try:
+        from faster_whisper import WhisperModel
+        print("[*] Transcribing speech using local AI Whisper model...")
+        model = WhisperModel("base", device="cpu", compute_type="int8")
+        segments, info = model.transcribe(media_path, beam_size=5, word_timestamps=True)
+
+        cues = []
+        for segment in segments:
+            words = list(segment.words or [])
+            if not words:
+                txt = segment.text.strip().upper()
+                if txt:
+                    cues.append((segment.start, segment.end, txt))
+                continue
+
+            chunk_size = 3
+            for i in range(0, len(words), chunk_size):
+                chunk = words[i:i + chunk_size]
+                st = chunk[0].start
+                et = chunk[-1].end
+                txt = " ".join(w.word.strip() for w in chunk).strip().upper()
+                if txt:
+                    cues.append((st, et, txt))
+
+        if not cues:
+            return False
+
+        ass_header = """[Script Info]
+ScriptType: v4.00+
+PlayResX: 1080
+PlayResY: 1920
+ScaledBorderAndShadow: yes
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: ShortsStyle,Impact,62,&H0000FFFF,&H00000000,&H00000000,&H90000000,1,0,0,0,100,100,1,0,1,5,3,2,60,60,340,1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+"""
+        events = []
+        for st, et, text in cues:
+            events.append(f"Dialogue: 0,{format_ass_timestamp(st)},{format_ass_timestamp(et)},ShortsStyle,,0,0,0,,{text}")
+
+        with open(ass_path, "w", encoding="utf-8") as f:
+            f.write(ass_header + "\n".join(events) + "\n")
+
+        print(f"[+] AI Whisper generated {len(cues)} subtitle cues!")
+        return True
+    except Exception as e:
+        print(f"[-] Whisper transcription fallback error: {e}")
+        return False
 
 def clip_and_format(url, spike, output_path, mode="blur", burn_subs=True, ass_path=None, temp_dir="./temp"):
     """
@@ -380,13 +419,18 @@ def clip_and_format(url, spike, output_path, mode="blur", burn_subs=True, ass_pa
         else:
             raise FileNotFoundError(f"Downloaded clip not found in {temp_dir}")
 
+    # Fallback to local AI Whisper if no YouTube subtitles were provided
+    if burn_subs and (not ass_path or not os.path.exists(ass_path)):
+        whisper_ass = os.path.join(temp_dir, "whisper_subs.ass")
+        if transcribe_with_whisper(raw_video, whisper_ass):
+            ass_path = whisper_ass
+
     has_nvenc = check_nvenc()
     vcodec = "h264_nvenc" if has_nvenc else "libx264"
     codec_flags = ["-c:v", vcodec, "-cq", "20", "-preset", "p5"] if has_nvenc else ["-c:v", "libx264", "-crf", "18", "-preset", "fast"]
 
     print(f"[*] Rendering to 9:16 vertical (1080x1920) via FFmpeg using encoder: {vcodec}...")
 
-    # For burning subtitles reliably on Windows, copy or use filename in temp_dir
     sub_filter = ""
     if burn_subs and ass_path and os.path.exists(ass_path):
         ass_filename = os.path.basename(ass_path)
@@ -417,7 +461,6 @@ def clip_and_format(url, spike, output_path, mode="blur", burn_subs=True, ass_pa
         os.path.abspath(output_path)
     ]
 
-    # Run in temp_dir so libass can load ass_filename directly without path escaping issues
     run_cmd(ff_cmd, capture=False, cwd=temp_dir)
     print(f"[+] Successfully exported clip to: {output_path}")
 
@@ -446,7 +489,6 @@ def main():
     print(f"[+] Total Duration: {total_dur:.1f}s ({total_dur/60:.1f} mins)")
     print(f"[+] Heatmap points detected: {len(heatmap)}")
 
-    # Subtitles handling
     ass_path = None
     vtt_temp = None
     if not args.no_captions:
@@ -470,7 +512,7 @@ def main():
                 vtt_temp = str(vtt_files[0])
                 print(f"[+] Found subtitle file: {vtt_temp}")
             else:
-                print("[-] No subtitles found on YouTube.")
+                print("[-] No subtitles found on YouTube. Will use local Whisper AI.")
         except Exception as e:
             print(f"[-] Subtitle fetch warning: {e}")
 
@@ -510,7 +552,6 @@ def main():
         out_filename = f"{safe_title}_short_{idx}.mp4"
         out_path = os.path.join(args.output_dir, out_filename)
 
-        # Generate ASS for this specific clip
         clip_ass = None
         if not args.no_captions and vtt_temp and os.path.exists(vtt_temp):
             clip_ass = os.path.join(temp_dir, f"clip_{idx}.ass")
@@ -518,7 +559,7 @@ def main():
             if not converted:
                 clip_ass = None
 
-        clip_and_format(args.url, spike, out_path, mode=args.mode, burn_subs=(clip_ass is not None), ass_path=clip_ass, temp_dir=temp_dir)
+        clip_and_format(args.url, spike, out_path, mode=args.mode, burn_subs=(not args.no_captions), ass_path=clip_ass, temp_dir=temp_dir)
 
     print("\n[🎉] Done! All YouTube Shorts clips are ready in:", os.path.abspath(args.output_dir))
 
