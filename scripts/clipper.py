@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 YouTube Shorts Highlight Clipper
-Automatically detects viewer replay heatmap peaks or audio spikes,
+Automatically detects viewer replay heatmap peaks or audio energy spikes,
 clips the highlight moment, formats into 9:16 vertical video (1080x1920),
 and burns in high-contrast Shorts-style subtitles.
 """
@@ -15,21 +15,22 @@ import argparse
 import subprocess
 from pathlib import Path
 
-def run_cmd(cmd, check=True, capture=True):
+def run_cmd(cmd, check=True, capture=True, cwd=None):
     """Run system command and return output."""
     res = subprocess.run(cmd, stdout=subprocess.PIPE if capture else None,
                          stderr=subprocess.PIPE if capture else None,
-                         text=True, encoding="utf-8", errors="replace")
+                         text=True, encoding="utf-8", errors="replace", cwd=cwd)
     if check and res.returncode != 0:
         err = res.stderr if capture else "Command failed"
         raise RuntimeError(f"Command failed ({res.returncode}): {' '.join(cmd)}\n{err}")
     return res
 
 def check_nvenc():
-    """Check if h264_nvenc is available in ffmpeg."""
+    """Check if h264_nvenc actually initializes with current Nvidia driver."""
     try:
-        res = subprocess.run(["ffmpeg", "-encoders"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, errors="replace")
-        return "h264_nvenc" in res.stdout
+        cmd = ["ffmpeg", "-v", "error", "-f", "lavfi", "-i", "color=c=black:s=64x64:d=0.1", "-c:v", "h264_nvenc", "-f", "null", "-"]
+        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        return res.returncode == 0
     except Exception:
         return False
 
@@ -49,6 +50,94 @@ def get_video_info(url):
         return data
     except Exception as e:
         raise ValueError(f"Failed to parse yt-dlp JSON output: {e}")
+
+def find_audio_spikes(url, total_duration, clip_duration=45.0, top_n=1, temp_dir="./temp"):
+    """
+    Fallback when heatmap is unavailable:
+    Downloads low-bitrate audio, decodes via FFmpeg to raw PCM,
+    and analyzes RMS energy to detect excitement/screaming/action peaks.
+    """
+    import numpy as np
+    os.makedirs(temp_dir, exist_ok=True)
+    temp_audio = os.path.join(temp_dir, "temp_probe_audio.m4a")
+
+    print("[*] Heatmap unavailable. Scanning audio energy spikes (reactions/hype)...")
+    if os.path.exists(temp_audio):
+        try:
+            os.remove(temp_audio)
+        except Exception:
+            pass
+
+    # Quick download low-bitrate audio (takes ~3-5 seconds even for 30m+ video)
+    dl_cmd = [
+        "yt-dlp",
+        "-f", "139/249/ba[abr<70]/ba",
+        "-o", temp_audio,
+        "--no-warnings",
+        url
+    ]
+    run_cmd(dl_cmd)
+
+    # Find the actual audio file
+    found_files = list(Path(temp_dir).glob("temp_probe_audio*"))
+    if not found_files:
+        raise FileNotFoundError("Audio probe file could not be downloaded")
+    audio_file = str(found_files[0])
+
+    # Decode audio to mono 16kHz PCM
+    sr = 16000
+    ff_cmd = ["ffmpeg", "-v", "error", "-i", audio_file, "-f", "s16le", "-ac", "1", "-ar", str(sr), "-"]
+    proc = subprocess.run(ff_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    raw = np.frombuffer(proc.stdout, dtype=np.int16)
+
+    # Clean up temp audio file
+    try:
+        os.remove(audio_file)
+    except Exception:
+        pass
+
+    if len(raw) == 0:
+        return []
+
+    # Calculate RMS per 1-second window
+    num_secs = len(raw) // sr
+    rms = np.zeros(num_secs, dtype=np.float32)
+    for i in range(num_secs):
+        chunk = raw[i * sr : (i + 1) * sr].astype(np.float32)
+        rms[i] = np.sqrt(np.mean(chunk**2))
+
+    # Ignore first 30 seconds or 5% of video
+    intro_cutoff = min(30, int(total_duration * 0.05))
+    rms[:intro_cutoff] = 0
+
+    # Sort peaks descending
+    sorted_indices = np.argsort(rms)[::-1]
+
+    spikes = []
+    for idx in sorted_indices:
+        peak_time = float(idx)
+        peak_val = float(rms[idx])
+
+        # Avoid overlapping peaks
+        if any(abs(peak_time - s["peak_time"]) < clip_duration * 0.8 for s in spikes):
+            continue
+
+        start_t = max(0.0, peak_time - (clip_duration * 0.50))
+        end_t = min(total_duration, start_t + clip_duration)
+        if (end_t - start_t) < clip_duration and start_t > 0:
+            start_t = max(0.0, end_t - clip_duration)
+
+        spikes.append({
+            "peak_time": peak_time,
+            "peak_val": peak_val / (np.max(rms) + 1e-6),
+            "start_time": start_t,
+            "end_time": end_t,
+            "duration": end_t - start_t
+        })
+        if len(spikes) >= top_n:
+            break
+
+    return spikes
 
 def find_heatmap_spikes(heatmap, total_duration, clip_duration=45.0, top_n=1):
     """
@@ -155,20 +244,25 @@ def convert_vtt_to_shorts_ass(vtt_path, ass_path, clip_start, clip_end):
     with open(vtt_path, "r", encoding="utf-8", errors="replace") as f:
         content = f.read()
 
-    # Regex to extract cue blocks
     cue_pattern = re.compile(
         r"((?:\d{1,2}:)?\d{2}:\d{2}[\.,]\d{3})\s*-->\s*((?:\d{1,2}:)?\d{2}:\d{2}[\.,]\d{3})[^\r\n]*\r?\n([\s\S]*?)(?=\n\n|\n\r\n|\Z)"
     )
 
     cues = []
+    last_text = ""
     for match in cue_pattern.finditer(content):
         st = parse_vtt_timestamp(match.group(1).replace(",", "."))
         et = parse_vtt_timestamp(match.group(2).replace(",", "."))
         raw_text = clean_vtt_text(match.group(3))
         lines = [l.strip() for l in raw_text.splitlines() if l.strip()]
         text = " ".join(lines)
-        if text and et > clip_start and st < clip_end:
-            # Shift relative to clip
+
+        # Ignore repeated consecutive auto-sub lines
+        if not text or text == last_text:
+            continue
+        last_text = text
+
+        if et > clip_start and st < clip_end:
             rel_st = max(0.0, st - clip_start)
             rel_et = min(clip_end - clip_start, et - clip_start)
             if rel_et > rel_st:
@@ -195,7 +289,7 @@ def convert_vtt_to_shorts_ass(vtt_path, ass_path, clip_start, clip_end):
 
     # ASS Header with high-impact Shorts font styling
     # Font: Arial Black / Impact, Bold, Bright Yellow text (&H0000FFFF), Deep Black outline (&H00000000)
-    # Alignment: 2 (Bottom Center), MarginV: 320 (comfortably above Shorts UI elements)
+    # Alignment: 2 (Bottom Center), MarginV: 340 (comfortably above Shorts UI elements)
     ass_header = """[Script Info]
 ScriptType: v4.00+
 PlayResX: 1080
@@ -204,7 +298,7 @@ ScaledBorderAndShadow: yes
 
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: ShortsStyle,Impact,64,&H0000FFFF,&H00000000,&H00000000,&H90000000,1,0,0,0,100,100,1,0,1,6,3,2,60,60,340,1
+Style: ShortsStyle,Impact,62,&H0000FFFF,&H00000000,&H00000000,&H90000000,1,0,0,0,100,100,1,0,1,5,3,2,60,60,340,1
 
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
@@ -236,7 +330,6 @@ def clip_and_format(url, spike, output_path, mode="blur", burn_subs=True, ass_pa
             pass
 
     print(f"[*] Downloading segment {start_s:.1f}s -> {end_s:.1f}s ({spike['duration']:.1f}s)...")
-    # yt-dlp download specific section
     dl_cmd = [
         "yt-dlp",
         "--download-sections", f"*{start_s:.2f}-{end_s:.2f}",
@@ -249,7 +342,6 @@ def clip_and_format(url, spike, output_path, mode="blur", burn_subs=True, ass_pa
     run_cmd(dl_cmd)
 
     if not os.path.exists(raw_video):
-        # Check if yt-dlp appended extension or changed filename
         files = list(Path(temp_dir).glob("raw_clip*"))
         if files:
             raw_video = str(files[0])
@@ -262,34 +354,26 @@ def clip_and_format(url, spike, output_path, mode="blur", burn_subs=True, ass_pa
 
     print(f"[*] Rendering to 9:16 vertical (1080x1920) via FFmpeg using encoder: {vcodec}...")
 
-    # Build filtergraph
-    # Escape path for FFmpeg subtitles filter on Windows
+    # For burning subtitles reliably on Windows, copy or use filename in temp_dir
     sub_filter = ""
     if burn_subs and ass_path and os.path.exists(ass_path):
-        clean_ass = os.path.abspath(ass_path).replace("\\", "/").replace(":", "\\:")
-        sub_filter = f",subtitles='{clean_ass}'"
+        ass_filename = os.path.basename(ass_path)
+        sub_filter = f",subtitles='{ass_filename}'"
 
     if mode == "blur":
-        # Blurred background (scale up + crop to 1080x1920 + boxblur) + centered sharp 16:9 foreground
         vf = (
             f"[0:v]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,boxblur=25:5[bg];"
             f"[0:v]scale=1080:1920:force_original_aspect_ratio=decrease[fg];"
             f"[bg][fg]overlay=(W-w)/2:(H-h)/2{sub_filter}[v]"
         )
     elif mode == "crop":
-        # Direct center 9:16 crop
-        vf = (
-            f"[0:v]scale=-1:1920,crop=1080:1920:(in_w-1080)/2:0{sub_filter}[v]"
-        )
+        vf = f"[0:v]scale=-1:1920,crop=1080:1920:(in_w-1080)/2:0{sub_filter}[v]"
     else: # fit
-        # Black letterboxing
-        vf = (
-            f"[0:v]scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(1080-iw)/2:(1920-ih)/2:black{sub_filter}[v]"
-        )
+        vf = f"[0:v]scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(1080-iw)/2:(1920-ih)/2:black{sub_filter}[v]"
 
     ff_cmd = [
         "ffmpeg", "-y",
-        "-i", raw_video,
+        "-i", os.path.abspath(raw_video),
         "-filter_complex", vf,
         "-map", "[v]",
         "-map", "0:a?",
@@ -298,10 +382,11 @@ def clip_and_format(url, spike, output_path, mode="blur", burn_subs=True, ass_pa
         "-b:a", "192k",
         "-r", "30",
         "-pix_fmt", "yuv420p",
-        output_path
+        os.path.abspath(output_path)
     ]
 
-    run_cmd(ff_cmd, capture=False)
+    # Run in temp_dir so libass can load ass_filename directly without path escaping issues
+    run_cmd(ff_cmd, capture=False, cwd=temp_dir)
     print(f"[+] Successfully exported clip to: {output_path}")
 
 def main():
@@ -323,7 +408,7 @@ def main():
     info = get_video_info(args.url)
     title = info.get("title", "clip")
     total_dur = float(info.get("duration", 0))
-    heatmap = info.get("heatmap", [])
+    heatmap = info.get("heatmap") or []
 
     print(f"\n[+] Video: {title}")
     print(f"[+] Total Duration: {total_dur:.1f}s ({total_dur/60:.1f} mins)")
@@ -331,10 +416,11 @@ def main():
 
     # Subtitles handling
     ass_path = None
+    vtt_temp = None
     if not args.no_captions:
-        vtt_temp = os.path.join(temp_dir, "subtitles.vtt")
         print("[*] Downloading video subtitles / auto-captions...")
         try:
+            sub_prefix = os.path.join(temp_dir, "subtitles")
             sub_cmd = [
                 "yt-dlp",
                 "--write-auto-sub",
@@ -342,22 +428,19 @@ def main():
                 "--sub-lang", "en.*,en",
                 "--sub-format", "vtt",
                 "--skip-download",
-                "-o", os.path.join(temp_dir, "subtitles"),
+                "-o", sub_prefix,
                 "--no-warnings",
                 args.url
             ]
             run_cmd(sub_cmd, check=False)
-            # Find generated vtt
             vtt_files = list(Path(temp_dir).glob("subtitles*.vtt"))
             if vtt_files:
                 vtt_temp = str(vtt_files[0])
                 print(f"[+] Found subtitle file: {vtt_temp}")
             else:
-                vtt_temp = None
                 print("[-] No subtitles found on YouTube.")
         except Exception as e:
             print(f"[-] Subtitle fetch warning: {e}")
-            vtt_temp = None
 
     if args.start is not None and args.end is not None:
         spikes = [{
@@ -368,10 +451,13 @@ def main():
             "duration": args.end - args.start
         }]
     else:
-        spikes = find_heatmap_spikes(heatmap, total_dur, clip_duration=args.duration, top_n=args.top_n)
+        if heatmap:
+            spikes = find_heatmap_spikes(heatmap, total_dur, clip_duration=args.duration, top_n=args.top_n)
+        else:
+            spikes = find_audio_spikes(args.url, total_dur, clip_duration=args.duration, top_n=args.top_n, temp_dir=temp_dir)
 
     if not spikes:
-        print("[-] No distinct heatmap peaks found. Using highlight window from 30% mark.")
+        print("[-] Fallback to highlight window from 30% mark.")
         start_t = min(30.0, total_dur * 0.3)
         end_t = min(total_dur, start_t + args.duration)
         spikes = [{
@@ -384,7 +470,8 @@ def main():
 
     print(f"\n[+] Selected {len(spikes)} highlight moment(s):")
     for i, s in enumerate(spikes, 1):
-        print(f"  Clip #{i}: Peak at {s['peak_time']:.1f}s (Intensity: {s['peak_val']:.2f}) | Window: {s['start_time']:.1f}s -> {s['end_time']:.1f}s ({s['duration']:.1f}s)")
+        m, sec = divmod(s['peak_time'], 60)
+        print(f"  Clip #{i}: Peak at {int(m)}m {int(sec)}s ({s['peak_time']:.1f}s, Intensity: {s['peak_val']:.2f}) | Window: {s['start_time']:.1f}s -> {s['end_time']:.1f}s ({s['duration']:.1f}s)")
 
     for idx, spike in enumerate(spikes, 1):
         safe_title = re.sub(r'[\\/*?:"<>|]', "", title)[:30].strip()
