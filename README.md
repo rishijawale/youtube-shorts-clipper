@@ -4,8 +4,23 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![FFmpeg Supported](https://img.shields.io/badge/FFmpeg-NVENC%20%2F%20x264-red.svg)](https://ffmpeg.org/)
 [![YouTube Most Replayed](https://img.shields.io/badge/Detection-Viewer%20Heatmap-FF0000.svg)](https://github.com/yt-dlp/yt-dlp)
+[![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](https://github.com/rishijawale/youtube-shorts-clipper/pulls)
 
 An open-source CLI tool and agent skill that automatically detects highlight moments in YouTube videos based on viewer replay heatmaps and engagement spikes, converts them into 9:16 vertical video (1080x1920 Full HD), and burns in high-contrast Shorts-style subtitles.
+
+---
+
+## ⚡ Why YouTube Shorts Clipper vs Paid SaaS?
+
+| Feature | Paid SaaS (Opus Clip, Klap, Vidyo) | **YouTube Shorts Clipper** |
+|:---|:---:|:---:|
+| **Cost** | \$15 – \$50 / month | **100% Free & Open-Source** |
+| **Video Processing Limits** | Capped minutes per month | **Unlimited** |
+| **Data Privacy** | Cloud uploads / server storage | **Runs 100% Locally on your PC** |
+| **Highlight Detection** | AI guesswork / hallucinated hooks | **YouTube's real viewer replay heatmap** |
+| **Watermarks** | Yes (on free/cheap tiers) | **Never** |
+| **Speed** | Cloud queue wait times | **Instant local GPU (NVIDIA NVENC)** |
+| **API Keys Required** | Yes (OpenAI / proprietary credits) | **None required** |
 
 ---
 
@@ -114,9 +129,23 @@ python scripts/clipper.py "https://www.youtube.com/watch?v=dQw4w9WgXcQ" --mode c
 
 ---
 
+## ❓ Frequently Asked Questions (FAQ)
+
+#### Do I need a YouTube API key?
+**No.** The tool extracts heatmap data and metadata without requiring Google Cloud or YouTube API keys.
+
+#### Does it work on Mac and Linux?
+**Yes.** While a `.bat` launcher is provided for Windows, the Python core (`scripts/clipper.py`) works identically on macOS and Linux.
+
+#### What if a video doesn't have subtitles?
+If manual or auto-generated YouTube subtitles are not enabled on the video, the tool clips the highlight video cleanly and alerts you.
+
+---
+
 ## 🤝 Contributing
 
 Contributions, issues, and feature requests are welcome!
+Feel free to open an issue or submit a Pull Request.
 
 ---
 
