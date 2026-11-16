@@ -330,16 +330,48 @@ def clip_and_format(url, spike, output_path, mode="blur", burn_subs=True, ass_pa
             pass
 
     print(f"[*] Downloading segment {start_s:.1f}s -> {end_s:.1f}s ({spike['duration']:.1f}s)...")
-    dl_cmd = [
-        "yt-dlp",
-        "--download-sections", f"*{start_s:.2f}-{end_s:.2f}",
-        "-f", "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
-        "--force-keyframes-at-cuts",
-        "-o", raw_video,
-        "--no-warnings",
-        url
-    ]
-    run_cmd(dl_cmd)
+    downloaded = False
+    try:
+        g_cmd = [
+            "yt-dlp", "-g",
+            "-f", "bv*[height<=1080][ext=mp4]+ba*[language=en]/bv*[height<=1080]+ba*/b[height<=1080]/b",
+            url
+        ]
+        res = run_cmd(g_cmd)
+        urls = [u.strip() for u in res.stdout.strip().splitlines() if u.strip()]
+        if urls:
+            if len(urls) >= 2:
+                v_url, a_url = urls[0], urls[1]
+                ff_cut = [
+                    "ffmpeg", "-y",
+                    "-ss", f"{start_s:.2f}", "-to", f"{end_s:.2f}", "-i", v_url,
+                    "-ss", f"{start_s:.2f}", "-to", f"{end_s:.2f}", "-i", a_url,
+                    "-c", "copy",
+                    raw_video
+                ]
+            else:
+                ff_cut = [
+                    "ffmpeg", "-y",
+                    "-ss", f"{start_s:.2f}", "-to", f"{end_s:.2f}", "-i", urls[0],
+                    "-c", "copy",
+                    raw_video
+                ]
+            run_cmd(ff_cut, capture=False)
+            if os.path.exists(raw_video) and os.path.getsize(raw_video) > 10000:
+                downloaded = True
+    except Exception as e:
+        print(f"[-] Fast stream cut fallback: {e}")
+
+    if not downloaded:
+        dl_cmd = [
+            "yt-dlp",
+            "--download-sections", f"*{start_s:.2f}-{end_s:.2f}",
+            "-f", "bv*[height<=1080][ext=mp4]+ba*[language=en]/bv*[height<=1080]+ba*/b[height<=1080]/b",
+            "-o", raw_video,
+            "--no-warnings",
+            url
+        ]
+        run_cmd(dl_cmd)
 
     if not os.path.exists(raw_video):
         files = list(Path(temp_dir).glob("raw_clip*"))
