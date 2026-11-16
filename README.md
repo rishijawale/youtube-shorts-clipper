@@ -36,7 +36,6 @@ An open-source CLI tool and agent skill that automatically detects highlight mom
   - Chunks speech into punchy 2–4 word viral captions (TikTok/Shorts retention style).
   - High-visibility yellow lettering with heavy black outline and drop shadow placed safely above YouTube Shorts navigation controls.
 - ⚡ **Hardware Accelerated Encoding**: Auto-detects NVIDIA NVENC (`h264_nvenc`) for blazing fast exports, falling back cleanly to `libx264`.
-- 🪟 **One-Click Windows Launcher**: Includes `run_clipper.bat` for interactive double-click usage.
 
 ---
 
@@ -86,10 +85,7 @@ pip install -r requirements.txt
 
 ## 💻 Usage
 
-### 1. Interactive Windows Launcher
-Simply double-click **`run_clipper.bat`** and enter the YouTube URL when prompted.
-
-### 2. Command Line Interface (CLI)
+Run the clipper directly via Python:
 
 ```bash
 python scripts/clipper.py "<YOUTUBE_URL>" [options]
