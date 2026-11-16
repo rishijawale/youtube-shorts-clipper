@@ -62,7 +62,7 @@ YouTube URL ──► yt-dlp Metadata & Heatmap ──► Peak Detection Algorit
 ## 🚀 Installation
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/youtube-shorts-clipper.git
+git clone https://github.com/rishijawale/youtube-shorts-clipper.git
 cd youtube-shorts-clipper
 pip install -r requirements.txt
 ```
